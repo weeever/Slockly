@@ -1,49 +1,36 @@
 // src/app/api/auth/spotify/callback/route.ts
-import { cookies } from 'next/headers';
 import { NextResponse } from 'next/server';
-import { SERVER_URL, exchangeCodeForTokens } from '@/lib/spotify';
+import { cookies } from 'next/headers';
+import { exchangeCodeForTokens } from '@/lib/spotify';
 
-export async function GET(req: Request){
-  const jar = cookies();
-  const u = new URL(req.url);
-  const code = u.searchParams.get('code') || '';
-  const stateParam = u.searchParams.get('state') || '';
-  const error = u.searchParams.get('error');
+export async function GET(req: Request) {
+  const url = new URL(req.url);
+  const code = url.searchParams.get('code') || '';
+  const state = url.searchParams.get('state') || '';
 
-  if (error){
-    return NextResponse.redirect(`${SERVER_URL}/?error=${encodeURIComponent(error)}`);
-  }
-  if (!code){
-    return NextResponse.redirect(`${SERVER_URL}/?error=code`);
-  }
+  const c = cookies();
+  const saved = c.get('slockly_oauth_state')?.value || '';
+  const verifier = c.get('slockly_pkce_verifier')?.value || '';
+  const secure = false;
 
-  const stateCookie = jar.get('slockly_state')?.value || '';
-  if (!stateCookie || stateCookie !== stateParam){
-    return NextResponse.redirect(`${SERVER_URL}/?error=state`);
+  if (!state || state !== saved) {
+    return NextResponse.redirect(new URL('/?error=state', url.origin));
   }
-  const verifier = jar.get('slockly_pkce_verifier')?.value || '';
-  if (!verifier){
-    return NextResponse.redirect(`${SERVER_URL}/?error=pkce`);
+  if (!code || !verifier) {
+    return NextResponse.redirect(new URL('/?error=pkce', url.origin));
   }
 
-  try{
-    const tok = await exchangeCodeForTokens(code, verifier);
-    const now = Date.now();
-    const atExp = new Date(now + (tok.expires_in||3600)*1000);
-    const rt = tok.refresh_token || '';
-
-    // Set cookies
-    jar.set('slockly_at', tok.access_token, { httpOnly: true, path: '/', sameSite: 'lax', expires: atExp });
-    if (rt){
-      // 30 days
-      jar.set('slockly_rt', rt, { httpOnly: true, path: '/', sameSite: 'lax', maxAge: 60*60*24*30 });
+  try {
+    const tok = await exchangeCodeForTokens(code, verifier, req);
+    c.delete('slockly_oauth_state');
+    c.delete('slockly_pkce_verifier');
+    c.set('slockly_at', tok.access_token, { httpOnly: true, sameSite: 'lax', secure, path: '/' });
+    if (tok.refresh_token) {
+      c.set('slockly_rt', tok.refresh_token, { httpOnly: true, sameSite: 'lax', secure, path: '/' });
     }
-    // clear transient
-    jar.set('slockly_state', '', { path: '/', maxAge: 0 });
-    jar.set('slockly_pkce_verifier', '', { path: '/', maxAge: 0 });
-
-    return NextResponse.redirect(`${SERVER_URL}/app`);
-  }catch(e){
-    return NextResponse.redirect(`${SERVER_URL}/?error=token`);
+    return NextResponse.redirect(new URL('/app', url.origin));
+  } catch (e:any) {
+    console.error('spotify_callback_error', e?.message || e);
+    return NextResponse.redirect(new URL('/?error=token', url.origin));
   }
 }
