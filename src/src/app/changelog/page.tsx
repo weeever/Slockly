@@ -1,0 +1,1 @@
+export default function ChangelogPage(){return <div className='p-8'>Changelog 0.0.1</div>}
