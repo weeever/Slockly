@@ -1,36 +1,33 @@
 // src/app/api/auth/spotify/callback/route.ts
-import { NextResponse } from 'next/server';
-import { cookies } from 'next/headers';
-import { exchangeCodeForTokens } from '@/lib/spotify';
+import { NextRequest, NextResponse } from 'next/server';
+import { exchangeCodeForTokens, setAccessCookie, setRefreshCookie, buildRedirectUri } from '@/lib/spotify';
 
-export async function GET(req: Request) {
+export async function GET(req: NextRequest){
   const url = new URL(req.url);
-  const code = url.searchParams.get('code') || '';
-  const state = url.searchParams.get('state') || '';
+  const origin = process.env.SERVER_URL || `${url.protocol}//${url.host}`;
+  const code = url.searchParams.get('code');
+  const state = url.searchParams.get('state');
 
-  const c = cookies();
-  const saved = c.get('slockly_oauth_state')?.value || '';
-  const verifier = c.get('slockly_pkce_verifier')?.value || '';
-  const secure = false;
+  const cookiesIn = req.cookies;
+  const expectedState = cookiesIn.get('slockly_state')?.value;
+  const verifier = cookiesIn.get('slockly_pkce')?.value;
 
-  if (!state || state !== saved) {
-    return NextResponse.redirect(new URL('/?error=state', url.origin));
-  }
-  if (!code || !verifier) {
-    return NextResponse.redirect(new URL('/?error=pkce', url.origin));
+  if (!code || !verifier || !state || !expectedState || state !== expectedState){
+    return NextResponse.redirect(`${origin}/?error=token`);
   }
 
-  try {
-    const tok = await exchangeCodeForTokens(code, verifier, req);
-    c.delete('slockly_oauth_state');
-    c.delete('slockly_pkce_verifier');
-    c.set('slockly_at', tok.access_token, { httpOnly: true, sameSite: 'lax', secure, path: '/' });
-    if (tok.refresh_token) {
-      c.set('slockly_rt', tok.refresh_token, { httpOnly: true, sameSite: 'lax', secure, path: '/' });
-    }
-    return NextResponse.redirect(new URL('/app', url.origin));
-  } catch (e:any) {
-    console.error('spotify_callback_error', e?.message || e);
-    return NextResponse.redirect(new URL('/?error=token', url.origin));
+  try{
+    const tok = await exchangeCodeForTokens(code, verifier, origin);
+    setAccessCookie(tok.access_token, tok.expires_in, origin);
+    if (tok.refresh_token) setRefreshCookie(tok.refresh_token, origin);
+
+    // clear transient cookies
+    const res = NextResponse.redirect(`${origin}/app`);
+    res.cookies.set('slockly_state', '', { path:'/', maxAge: 0 });
+    res.cookies.set('slockly_pkce', '', { path:'/', maxAge: 0 });
+    return res;
+  }catch(e:any){
+    const res = NextResponse.redirect(`${origin}/?error=token`);
+    return res;
   }
 }
