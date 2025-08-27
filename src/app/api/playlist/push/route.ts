@@ -1,25 +1,30 @@
 // src/app/api/playlist/push/route.ts
+/* eslint-disable @typescript-eslint/no-explicit-any */
 import { NextRequest, NextResponse } from 'next/server';
-import { getValidAccessToken, getMe, createPlaylist, addTracks } from '@/lib/spotify';
+import { getAccessCookie, getMe, createPlaylist, addTracksToPlaylist } from '@/lib/spotify';
+
+type Body = { name: string; tracks: { uri: string }[]; description?: string; isPublic?: boolean };
 
 export async function POST(req: NextRequest){
-  const token = await getValidAccessToken();
-  if (!token) return NextResponse.json({ error:'unauthorized' }, { status: 401 });
-
-  const { name, uris } = await req.json().catch(()=>({}));
-  if (!Array.isArray(uris) || uris.length === 0){
-    return NextResponse.json({ error:'no_tracks' }, { status: 422 });
-  }
-  const playlistName = String(name||'Playlist by Slockly').slice(0, 100);
+  const access = getAccessCookie();
+  if (!access) return NextResponse.json({ error: 'unauthenticated' }, { status: 401 });
+  const body = await req.json().catch(()=>({})) as Body;
+  const name = (body.name||'Playlist by Slockly').slice(0, 120);
+  const uris = (body.tracks||[]).map(t=>t.uri).filter(Boolean);
+  if (uris.length === 0) return NextResponse.json({ error: 'no_tracks' }, { status: 400 });
 
   try{
-    const me = await getMe();
-    const p = await createPlaylist(me.id, playlistName);
-    await addTracks(p.id, uris);
-    return NextResponse.json({ ok:true, id: p.id, url: p.external_urls?.spotify || null });
+    const me = await getMe(access);
+    const pl = await createPlaylist(access, me.id, name, body.description||'', !!body.isPublic);
+    const chunks:string[][] = [];
+    for (let i=0;i<uris.length;i+=100) chunks.push(uris.slice(i, i+100));
+    for (const c of chunks){
+      await addTracksToPlaylist(access, pl.id, c);
+    }
+    return NextResponse.json({ ok:true, id: pl.id, url: pl.external_urls?.spotify || '' });
   }catch(e:any){
-    const msg = String(e?.message||'');
-    const status = msg.startsWith('spotify_http_') ? Number(msg.slice(13)) : 500;
-    return NextResponse.json({ error:'push_failed', status, detail: msg }, { status });
+    const status = e?.status || 500;
+    const detail = e?.detail || String(e?.message||'push_failed');
+    return NextResponse.json({ error: 'push_failed', status, detail }, { status: 500 });
   }
 }

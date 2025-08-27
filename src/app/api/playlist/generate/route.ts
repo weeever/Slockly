@@ -1,83 +1,80 @@
+// src/app/api/playlist/generate/route.ts
+/* eslint-disable @typescript-eslint/no-explicit-any */
 import { NextRequest, NextResponse } from 'next/server';
-import { getValidAccessToken } from '@/lib/spotify';
+import { getAccessCookie, getMe, searchArtists, availableGenreSeeds, recommendations, withPreviews, searchTracks } from '@/lib/spotify';
+import { proposePlanLLM } from '@/lib/ai/provider';
 
-const API = 'https://api.spotify.com/v1';
-
-async function spGet(token: string, path: string, params: Record<string, any> = {}) {
-  const url = new URL(API + path);
-  for (const [k, v] of Object.entries(params)) {
-    if (v !== undefined && v !== null && String(v).length) url.searchParams.set(k, String(v));
-  }
-  const res = await fetch(url.toString(), { headers: { Authorization: `Bearer ${token}` } });
-  if (!res.ok) throw new Error(`spotify_http_${res.status}`);
-  return res.json();
-}
-
-function normalizeTrack(t: any){
-  return {
-    id: t.id,
-    name: t.name,
-    uri: t.uri,
-    previewUrl: t.preview_url ?? null,
-    artists: Array.isArray(t.artists) ? t.artists.map((a:any)=>a.name) : [],
-    image: t?.album?.images?.[0]?.url ?? null,
-  };
-}
+type Body = { prompt: string; approxN?: number };
 
 export async function POST(req: NextRequest){
+  const access = getAccessCookie();
+  if (!access) return NextResponse.json({ error: 'unauthenticated' }, { status: 401 });
+
+  const body = await req.json().catch(()=>({})) as Body;
+  const prompt = (body.prompt||'').trim();
+  const approxN = Math.max(1, Math.min(100, Number(body.approxN || 20)));
+
   try{
-    const token = await getValidAccessToken();
-    if (!token) return NextResponse.json({ error: 'unauthenticated' }, { status: 401 });
+    // 1) Ask LLM to plan
+    const plan = await proposePlanLLM(prompt);
 
-    const { prompt, approxN } = await req.json();
-    const q = String(prompt || '').trim();
-    const limit = Math.max(1, Math.min(100, Number(approxN) || 20));
+    // ensure n
+    const N = Math.max(1, Math.min(100, plan.n || approxN));
 
-    if (!q) return NextResponse.json({ error: 'no_prompt' }, { status: 422 });
+    // 2) Resolve artists + filter genres against Spotify allowed seeds
+    const me = await getMe(access);
+    const market = me.country || 'FR';
 
-    // 1) Try to get artist seeds
-    const searchArtists = await spGet(token, '/search', { q, type: 'artist', limit: 5, market: 'FR' });
-    const artistIds = (searchArtists?.artists?.items ?? []).slice(0, 5).map((a:any)=>a.id);
+    const allowedGenres = await availableGenreSeeds(access);
+    const seed_genres = (plan.genres||[]).map(g=>g.toLowerCase().trim()).filter(Boolean).filter(g=>allowedGenres.includes(g)).slice(0,5);
 
-    let recs: any[] = [];
-    if (artistIds.length){
-      try{
-        const r = await spGet(token, '/recommendations', {
-          seed_artists: artistIds.join(','),
-          limit: Math.min(100, limit*2), // take a bit more then dedupe
-          market: 'FR'
-        });
-        recs = (r?.tracks ?? []).map(normalizeTrack);
-      }catch(e:any){
-        // swallow and fallback
+    // find artist ids
+    const seed_artists: string[] = [];
+    for (const a of (plan.artists||[])){
+      if (seed_artists.length >= 5) break;
+      const found = await searchArtists(access, a, 1);
+      const id = found?.[0]?.id;
+      if (id) seed_artists.push(id);
+    }
+
+    // 3) If no seeds at all, try keywords -> find some tracks then lift their artists
+    let seed_tracks: string[] = [];
+    if (seed_artists.length === 0 && seed_genres.length === 0){
+      for (const kw of (plan.keywords||[])){
+        if (seed_tracks.length >= 5) break;
+        const tr = await searchTracks(access, kw, 1, market);
+        const id = tr?.[0]?.id;
+        if (id) seed_tracks.push(id);
       }
     }
 
-    // 2) Fallback: search tracks by query
-    if (!recs.length){
-      const searchTracks = await spGet(token, '/search', { q, type: 'track', limit: Math.min(50, limit*2), market: 'FR' });
-      recs = (searchTracks?.tracks?.items ?? []).map(normalizeTrack);
+    if (seed_artists.length + seed_genres.length + seed_tracks.length === 0){
+      return NextResponse.json({ error: 'no_seeds', detail: 'Aucun seed valide transmis à Spotify.' }, { status: 422 });
     }
 
-    // 3) Deduplicate and trim to N
-    const out: any[] = [];
+    // 4) Call recommendations
+    const rec = await recommendations(access, {
+      seed_artists, seed_genres, seed_tracks,
+      limit: N, market,
+    });
+
+    // 5) Format + dedupe
+    const tracks = withPreviews(rec);
     const seen = new Set<string>();
-    for (const t of recs){
-      if (!t?.id || seen.has(t.id)) continue;
+    const unique = tracks.filter(t=>{
+      if (!t.id) return false;
+      if (seen.has(t.id)) return false;
       seen.add(t.id);
-      out.push(t);
-      if (out.length >= limit) break;
-    }
+      return true;
+    });
 
-    if (!out.length){
-      return NextResponse.json({ error: 'no_results', detail: 'Aucun titre correspondant.' }, { status: 422 });
+    return NextResponse.json({ ok:true, plan, tracks: unique.slice(0,N) });
+  }catch(e:any){
+    if (e?.status === 422){
+      return NextResponse.json({ error: 'no_seeds', detail: 'Aucun seed valide transmis à Spotify.' }, { status: 422 });
     }
-
-    return NextResponse.json({ ok: true, tracks: out });
-  } catch (err:any){
-    const msg = String(err?.message || err || 'generate_failed');
-    const m = /spotify_http_(\d{3})/.exec(msg);
-    const sc = m ? Number(m[1]) : 500;
-    return NextResponse.json({ error: 'generate_failed', status: sc, detail: m ? m[1] : msg }, { status: 500 });
+    const status = e?.status || 500;
+    const detail = e?.detail || String(e?.message||'generate_failed');
+    return NextResponse.json({ error: 'generate_failed', status, detail }, { status: 500 });
   }
 }

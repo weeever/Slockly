@@ -1,135 +1,100 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
 // src/lib/ai/provider.ts
-// Sélectionne automatiquement un provider IA dispo (OpenAI, OpenRouter, Gemini) et
-// renvoie un plan JSON strict pour la génération de playlist.
-
-type Plan = {
-  seeds: { artists: string[]; genres: string[]; keywords?: string[] };
-  exclude?: { artists?: string[]; genres?: string[] };
-  diversity?: { maxPerArtist?: number };
-};
-
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
+// LLM-only planner. No heuristics. If no key -> throw explicit error.
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || process.env.OPENAI_API_KEY || '';
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || '';
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
 
-async function callJSONModel(system: string, user: string): Promise<any | null> {
-  // OpenAI compatible en priorité
-  if (OPENAI_API_KEY) {
+export type Plan = {
+  n: number;
+  artists: string[];
+  genres: string[];
+  keywords: string[];
+  exclusions: {
+    artists?: string[];
+    genres?: string[];
+    terms?: string[];
+  }
+};
+
+const SYSTEM = `Tu es un planificateur de playlist Spotify. Tu reçois une consigne libre en français.
+Ta sortie DOIT être un JSON strict (pas de texte autour) au format:
+{
+  "n": <entier>,
+  "artists": [noms d'artistes], 
+  "genres": [genres au format Spotify si connu], 
+  "keywords": [mots-clés libres], 
+  "exclusions": { "artists":[], "genres":[], "terms":[] }
+}
+Règles:
+- "n": si l'utilisateur donne un nombre (ou via 'Approx. N'), prends-le sinon 20 par défaut.
+- Remplis "artists" (max 8) avec des artistes pertinents.
+- Remplis "genres" (max 6) avec genres plausibles (même si certains ne sont pas seeds officiels).
+- "keywords": mots/phrases utiles (langue, époque, ambiance, bpm, etc.) max 10.
+- "exclusions": tout ce que l'utilisateur veut éviter (artistes/genres/termes).
+- Ne mets JAMAIS de duplicate dans artists/genres.
+- Ne propose AUCUN titre précis ici, seulement le plan.
+`;
+
+function chooseProvider(){
+  if (OPENAI_API_KEY) return 'openai';
+  if (OPENROUTER_API_KEY) return 'openrouter';
+  if (GEMINI_API_KEY) return 'gemini';
+  throw Object.assign(new Error('no_ai_provider'), { status: 503 });
+}
+
+export async function proposePlanLLM(prompt: string): Promise<Plan> {
+  const provider = chooseProvider();
+  if (provider === 'openai'){
     const res = await fetch('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({
         model: 'gpt-4o-mini',
-        messages: [
-          { role: 'system', content: system },
-          { role: 'user', content: user },
-        ],
-        temperature: 0.3,
         response_format: { type: 'json_object' },
+        messages: [
+          { role: 'system', content: SYSTEM },
+          { role: 'user', content: prompt }
+        ]
       })
     });
-    if (res.ok) {
-      const j = await res.json();
-      const txt = j?.choices?.[0]?.message?.content || '{}';
-      try { return JSON.parse(txt); } catch { return null; }
-    }
+    if (!res.ok) throw new Error('llm_failed_openai_'+res.status);
+    const json:any = await res.json();
+    const text = json.choices?.[0]?.message?.content || '{}';
+    return JSON.parse(text);
   }
-
-  // OpenRouter (OpenAI compatible)
-  if (OPENROUTER_API_KEY) {
+  if (provider === 'openrouter'){
     const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${OPENROUTER_API_KEY}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        model: 'openai/gpt-4o-mini',
+        model: 'anthropic/claude-3.5-sonnet:beta',
+        response_format: {"type":"json_object"},
         messages: [
-          { role: 'system', content: system },
-          { role: 'user', content: user },
-        ],
-        temperature: 0.3,
-        response_format: { type: 'json_object' },
+          { role: 'system', content: SYSTEM },
+          { role: 'user', content: prompt }
+        ]
       })
     });
-    if (res.ok) {
-      const j = await res.json();
-      const txt = j?.choices?.[0]?.message?.content || '{}';
-      try { return JSON.parse(txt); } catch { return null; }
-    }
+    if (!res.ok) throw new Error('llm_failed_openrouter_'+res.status);
+    const json:any = await res.json();
+    const text = json.choices?.[0]?.message?.content || '{}';
+    return JSON.parse(text);
   }
-
-  // Gemini (pas de JSON schema strict, on parse best-effort)
-  if (GEMINI_API_KEY) {
-    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_API_KEY}`, {
+  if (provider == 'gemini'){
+    // Gemini JSON mode via "contents" with schema-like prompt
+    const res = await fetch('https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key='+GEMINI_API_KEY, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        contents: [{ role: 'user', parts: [{ text: `${system}\n\nUSER:\n${user}\n\nRéponds UNIQUEMENT en JSON.` }] }]
+        contents: [{ role: 'user', parts: [{ text: SYSTEM + '\n\nUSER:\n' + prompt + '\nRéponds uniquement en JSON.' }]}],
+        generationConfig: { responseMimeType: 'application/json' }
       })
     });
-    if (res.ok) {
-      const j = await res.json();
-      const txt = j?.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
-      try { return JSON.parse(txt); } catch { return null; }
-    }
+    if (!res.ok) throw new Error('llm_failed_gemini_'+res.status);
+    const json:any = await res.json();
+    const text = json.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
+    return JSON.parse(text);
   }
-
-  return null;
-}
-
-export async function proposePlanLLM(prompt: string, N: number): Promise<Plan> {
-  const system = `
-Tu es un planificateur de playlists Spotify. Tu réponds UNIQUEMENT en JSON.
-Schéma : {"seeds":{"artists":[],"genres":[],"keywords":[]},"exclude":{"artists":[],"genres":[]},"diversity":{"maxPerArtist":2}}
-Règles :
-- "artists" = 3 à 8 artistes pertinents selon la demande.
-- "genres" = 2 à 8 genres (Spotify canonical si possible).
-- "keywords" = 2 à 6 mots/phrases utiles pour recherche textuelle.
-- "exclude" respecte strictement les interdictions utilisateur.
-- "diversity.maxPerArtist" propose 2 si N<=20, 3 si 21-40, 4 au-delà.
-Ne mets pas de commentaires. Pas d'autres clés.
-`.trim();
-
-  const user = `
-Prompt utilisateur: ${prompt}
-N demandé: ${N}
-`.trim();
-
-  const out = await callJSONModel(system, user);
-
-  // Fallback robuste si l'IA est indispo ou renvoie n'importe quoi
-  if (!out || typeof out !== 'object') {
-    // heuristique minimale pour éviter un échec dur
-    const p = (prompt || '').toLowerCase();
-    const artists: string[] = [];
-    const genres: string[] = [];
-
-    // très basique : si un mot unique -> artiste seed
-    if (p.trim().split(/\s+/).length <= 3) artists.push(prompt);
-
-    return {
-      seeds: { artists, genres, keywords: [prompt] },
-      exclude: { artists: [], genres: [] },
-      diversity: { maxPerArtist: N <= 20 ? 2 : N <= 40 ? 3 : 4 },
-    };
-  }
-
-  // Normalisation légère
-  const seeds = out.seeds || {};
-  seeds.artists = Array.isArray(seeds.artists) ? seeds.artists : [];
-  seeds.genres = Array.isArray(seeds.genres) ? seeds.genres : [];
-  seeds.keywords = Array.isArray(seeds.keywords) ? seeds.keywords : [];
-
-  const exclude = out.exclude || {};
-  exclude.artists = Array.isArray(exclude.artists) ? exclude.artists : [];
-  exclude.genres = Array.isArray(exclude.genres) ? exclude.genres : [];
-
-  const diversity = out.diversity || {};
-  let maxPerArtist = Number(diversity.maxPerArtist || 0);
-  if (!maxPerArtist) maxPerArtist = (N <= 20 ? 2 : (N <= 40 ? 3 : 4));
-
-  return {
-    seeds,
-    exclude,
-    diversity: { maxPerArtist },
-  };
+  throw Object.assign(new Error('no_ai_provider'), { status: 503 });
 }
